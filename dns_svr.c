@@ -218,8 +218,10 @@ int main(int argc, char** argv) {
             Cache the question and answer
             */
             get_timestamp(timestamp);
-            fprintf(log, "%s %s is at %s\n",timestamp, dns_message.question.QNAME , dns_response.answer.address); // TODO
-            fflush(log);
+            if(dns_response.header.ANCOUNT) {
+                fprintf(log, "%s %s is at %s\n",timestamp, dns_message.question.QNAME , dns_response.answer.address);
+                fflush(log);
+            }
 
             // Writes back to the client
             write(newsockfd, raw_dns_response.tcp_header, 2);
