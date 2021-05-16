@@ -10,9 +10,11 @@
 #include <sys/select.h>
 #include <sys/sendfile.h>
 #include <assert.h>
+#include <time.h>
 
 #define PORT "8053"
 #define MAX_DOMAIN_LENGTH 253
+#define TIMESTAMP_LENGTH 24
 
 // DNS header, only store information needed for this project
 // 
@@ -32,6 +34,7 @@ typedef struct {
     uint32_t TTL;
     uint16_t RDLENGTH;
     // store ipv6
+    char address[INET6_ADDRSTRLEN];
 }dns_answer_t;
 
 typedef struct {
@@ -50,12 +53,16 @@ typedef struct {
 dns_message_t read_message(raw_dns_message_t message);
 uint16_t read_two_bytes(uint8_t* start);
 raw_dns_message_t read_raw_message(int fd);
+void get_timestamp(char* timestamp);
 
 int main(int argc, char** argv) {
     if(argc < 3) {
         perror("usage: ./dns_svr server_ip port");
         exit(EXIT_FAILURE);
     }
+
+    FILE* log = fopen("./dns_svr.log", "w");
+
 
 
     int listen_sockfd;
@@ -65,6 +72,8 @@ int main(int argc, char** argv) {
     struct sockaddr_storage client_addr;
     socklen_t client_addr_size;
     client_addr_size = sizeof client_addr;
+
+    char timestamp[TIMESTAMP_LENGTH+1];
 
     // Create address we're going to listen on (with given port number)
     memset(&hints, 0, sizeof hints);
@@ -130,6 +139,10 @@ int main(int argc, char** argv) {
 
         dns_message_t dns_message = read_message(raw_message);
 
+        get_timestamp(timestamp);
+        fprintf(log, "%s requested %s\n", timestamp, dns_message.question.QNAME);
+        fflush(log);
+
         uint8_t* body = raw_message.body;
 
         if(dns_message.question.QTYPE != 28) {
@@ -137,6 +150,9 @@ int main(int argc, char** argv) {
             Not a AAAA requst, modify the header and return 
             */
             // printf("not a AAAA request\n");
+            get_timestamp(timestamp);
+            fprintf(log, "%s unimplemented request\n", timestamp);
+            fflush(log);
 
             // Set QR to 1
             body[2] = body[2] | 128;
@@ -186,20 +202,36 @@ int main(int argc, char** argv) {
             }
             freeaddrinfo(upstream_servinfo);
 
+            // Writes to upstream with the DNS request from client
             write(upstream_sockfd, raw_message.tcp_header, 2);
             write(upstream_sockfd, raw_message.body, raw_message.body_size);
 
+            // Read DNS response from the server
+            raw_dns_message_t raw_dns_response = read_raw_message(upstream_sockfd);
+            dns_message_t dns_response = read_message(raw_dns_response);
 
-            unsigned char recieve_buffer[256];
-            read(upstream_sockfd, recieve_buffer, 256);
+            // unsigned char recieve_buffer[256];
+            // read(upstream_sockfd, recieve_buffer, 256);
 
-            write(newsockfd, recieve_buffer, 256);
+            /*
+            Log <timestamp> <domain_name> is at <IP address>
+            Cache the question and answer
+            */
+            get_timestamp(timestamp);
+            fprintf(log, "%s %s is at %s\n",timestamp, dns_message.question.QNAME , dns_response.answer.address); // TODO
+            fflush(log);
+
+            // Writes back to the client
+            write(newsockfd, raw_dns_response.tcp_header, 2);
+            write(newsockfd, raw_dns_response.body, raw_dns_response.body_size);
+
             close(upstream_sockfd);
         }
         
         close(newsockfd);
     }
     close(listen_sockfd);
+    fclose(log);
     return 0;
 }
 
@@ -247,8 +279,24 @@ dns_message_t read_message(raw_dns_message_t message) {
 
     // Now points to the start of answer section
     current += 4;
+    // If there is a answer section
+    // Read the answer section and store the first one
     if(dns_header.ANCOUNT) {
-        // Read the answer section
+        dns_answer_t dns_answer;
+        // Now points to type
+        current += 2;
+        dns_answer.ATYPE = read_two_bytes(current);
+        
+        // Now points to TTL
+        current += 4;
+
+        // Now points to RDATA
+        current += 6;
+        if(inet_ntop(AF_INET6, current, dns_answer.address, INET6_ADDRSTRLEN) == NULL) {
+            perror("inet_ntop");
+            exit(EXIT_FAILURE);
+        }
+        dns_message.answer = dns_answer;
     }
 
     dns_message.header = dns_header;
@@ -297,4 +345,12 @@ raw_dns_message_t read_raw_message(int fd) {
 void free_raw_message(raw_dns_message_t* message) {
     free(message->tcp_header);
     free(message->body);
+}
+
+void get_timestamp(char* timestamp) {
+    time_t rawtime;
+    struct tm *info;
+    time(&rawtime);
+    info = localtime(&rawtime);
+    strftime(timestamp, TIMESTAMP_LENGTH + 1, "%FT%T%z", info);
 }
