@@ -61,6 +61,11 @@ int main(int argc, char** argv) {
     int listen_sockfd;
 	struct addrinfo hints, *res;
 
+    int newsockfd;
+    struct sockaddr_storage client_addr;
+    socklen_t client_addr_size;
+    client_addr_size = sizeof client_addr;
+
     // Create address we're going to listen on (with given port number)
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
@@ -80,7 +85,7 @@ int main(int argc, char** argv) {
 		exit(EXIT_FAILURE);
 	}
 
-    printf("listen on socket %d\n", listen_sockfd);
+    // printf("listen on socket %d\n", listen_sockfd);
 
     int enable = 1;
     if (setsockopt(listen_sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
@@ -99,14 +104,10 @@ int main(int argc, char** argv) {
 	if (listen(listen_sockfd, 5) < 0) {
 		perror("listen");
 		exit(EXIT_FAILURE);
-        
 	}
-    int newsockfd;
-    struct sockaddr_storage client_addr;
-    socklen_t client_addr_size;
-    client_addr_size = sizeof client_addr;
-    while(1){
 
+    while(true){
+        
         // Accept a connection - blocks until a connection is ready to be accepted
         // Get back a new file descriptor to communicate on
         newsockfd =
@@ -116,7 +117,7 @@ int main(int argc, char** argv) {
             exit(EXIT_FAILURE);
         }
 
-        printf("client socket created at %d!", newsockfd);
+        // printf("client socket created at %d!\n", newsockfd);
 
         /* 
         Connection established with client
@@ -131,7 +132,6 @@ int main(int argc, char** argv) {
 
         uint8_t* body = raw_message.body;
 
-        printf("read message successful");
         if(dns_message.question.QTYPE != 28) {
             /*
             Not a AAAA requst, modify the header and return 
@@ -144,9 +144,9 @@ int main(int argc, char** argv) {
             // Set RCODE to 4
             body[3] = (body[3] & 240) | 4;
 
+            // Set RA from 0 to 1
             body[3] ^= (1 << 7);
 
-            printf("%02x", body[3]);
 
             // Sent back to the client
             write(newsockfd, raw_message.tcp_header, 2);
@@ -192,13 +192,6 @@ int main(int argc, char** argv) {
 
             unsigned char recieve_buffer[256];
             read(upstream_sockfd, recieve_buffer, 256);
-
-            // printf("Second n: %d\n",n);
-
-            // for(int i = 0; i < n; i++) {
-            //     printf("%02x ",recieve_buffer[i]);
-            // }
-            // printf("\n");
 
             write(newsockfd, recieve_buffer, 256);
             close(upstream_sockfd);
@@ -281,17 +274,22 @@ raw_dns_message_t read_raw_message(int fd) {
         size -= read(fd, header_buffer+(2-size), size);
     }
 
+    // for(int i = 0; i < 2; i++) printf("%02x ",header_buffer[i]);
+
     size = read_two_bytes(header_buffer);
+    message.body_size = read_two_bytes(header_buffer);
+
     uint8_t* body_buffer = (uint8_t*) malloc(sizeof(uint8_t) * size);
     assert(body_buffer);
 
     while(size > 0) {
-        size -= read(fd, body_buffer+(2-size), size);
+        size -= read(fd, body_buffer+(message.body_size-size), size);
     }
 
+    // for(int i = 0; i < message.body_size; i++) printf("%02x ",body_buffer[i]);
     message.tcp_header = header_buffer;
     message.body = body_buffer;
-    message.body_size = size;
+    
 
     return message;
 }
