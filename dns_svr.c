@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/sendfile.h>
+#include <assert.h>
 
 #define PORT "8053"
 #define MAX_DOMAIN_LENGTH 253
@@ -39,9 +40,16 @@ typedef struct {
     dns_answer_t answer;
 }dns_message_t;
 
+typedef struct {
+    uint8_t* tcp_header;
+    uint8_t* body;
+    uint16_t body_size;
+}raw_dns_message_t;
 
-dns_message_t read_message(uint16_t header, uint8_t* raw_message);
+
+dns_message_t read_message(raw_dns_message_t message);
 uint16_t read_two_bytes(uint8_t* start);
+raw_dns_message_t read_raw_message(int fd);
 
 int main(int argc, char** argv) {
     if(argc < 3) {
@@ -71,6 +79,8 @@ int main(int argc, char** argv) {
 		perror("socket");
 		exit(EXIT_FAILURE);
 	}
+
+    printf("listen on socket %d\n", listen_sockfd);
 
     int enable = 1;
     if (setsockopt(listen_sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
@@ -106,6 +116,8 @@ int main(int argc, char** argv) {
             exit(EXIT_FAILURE);
         }
 
+        printf("client socket created at %d!", newsockfd);
+
         /* 
         Connection established with client
         Need to read() dns message from client
@@ -113,14 +125,13 @@ int main(int argc, char** argv) {
         If AAAA request, connect to upstream dns
         */
 
-        uint8_t header_buffer[2];
-        read(newsockfd, header_buffer, 2);
-        uint16_t size = read_two_bytes(header_buffer);
+        raw_dns_message_t raw_message = read_raw_message(newsockfd);
 
-        uint8_t body_buffer[size];
-        read(newsockfd, body_buffer, size);
-        dns_message_t dns_message = read_message(size, body_buffer);
+        dns_message_t dns_message = read_message(raw_message);
 
+        uint8_t* body = raw_message.body;
+
+        printf("read message successful");
         if(dns_message.question.QTYPE != 28) {
             /*
             Not a AAAA requst, modify the header and return 
@@ -128,14 +139,18 @@ int main(int argc, char** argv) {
             // printf("not a AAAA request\n");
 
             // Set QR to 1
-            body_buffer[2] = body_buffer[2] | 128;
+            body[2] = body[2] | 128;
 
             // Set RCODE to 4
-            body_buffer[3] = (body_buffer[3] & 240) | 4;
+            body[3] = (body[3] & 240) | 4;
+
+            body[3] ^= (1 << 7);
+
+            printf("%02x", body[3]);
 
             // Sent back to the client
-            write(newsockfd, header_buffer, 2);
-            write(newsockfd, body_buffer, size);
+            write(newsockfd, raw_message.tcp_header, 2);
+            write(newsockfd, raw_message.body, raw_message.body_size);
 
         }else {
             /*
@@ -171,8 +186,8 @@ int main(int argc, char** argv) {
             }
             freeaddrinfo(upstream_servinfo);
 
-            write(upstream_sockfd, header_buffer, 2);
-            write(upstream_sockfd, body_buffer, size);
+            write(upstream_sockfd, raw_message.tcp_header, 2);
+            write(upstream_sockfd, raw_message.body, raw_message.body_size);
 
 
             unsigned char recieve_buffer[256];
@@ -198,14 +213,13 @@ int main(int argc, char** argv) {
 
 
 // Reads a dns message
-// 
-dns_message_t read_message(uint16_t header, uint8_t* raw_message) {
+dns_message_t read_message(raw_dns_message_t message) {
     dns_message_t dns_message;
     dns_header_t dns_header;
     dns_question_t dns_question;
     // dns_answer_t dns_answer;
 
-    uint8_t* current = raw_message;
+    uint8_t* current = message.body;
     dns_header.ID = read_two_bytes(current);
 
     // Now points to the 4th byte
@@ -255,4 +269,34 @@ uint16_t read_two_bytes(uint8_t* start) {
     return ntohs(*two_byte);
 }
 
+raw_dns_message_t read_raw_message(int fd) {
+    raw_dns_message_t message;
 
+    uint8_t *header_buffer = (uint8_t*) malloc(sizeof(uint8_t) * 2);
+    assert(header_buffer);
+
+    uint16_t size = 2;
+
+    while(size > 0) {
+        size -= read(fd, header_buffer+(2-size), size);
+    }
+
+    size = read_two_bytes(header_buffer);
+    uint8_t* body_buffer = (uint8_t*) malloc(sizeof(uint8_t) * size);
+    assert(body_buffer);
+
+    while(size > 0) {
+        size -= read(fd, body_buffer+(2-size), size);
+    }
+
+    message.tcp_header = header_buffer;
+    message.body = body_buffer;
+    message.body_size = size;
+
+    return message;
+}
+
+void free_raw_message(raw_dns_message_t* message) {
+    free(message->tcp_header);
+    free(message->body);
+}
