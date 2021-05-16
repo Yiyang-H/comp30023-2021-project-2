@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
             Cache the question and answer
             */
             get_timestamp(timestamp);
-            if(dns_response.header.ANCOUNT) {
+            if(dns_response.header.ANCOUNT && dns_response.answer.ATYPE == 28) {
                 fprintf(log, "%s %s is at %s\n",timestamp, dns_message.question.QNAME , dns_response.answer.address);
                 fflush(log);
             }
