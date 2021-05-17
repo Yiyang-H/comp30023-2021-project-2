@@ -1,3 +1,6 @@
 phase1
 packets/
 dns_svr
+*.o
+.vscode
+dns_svr.log

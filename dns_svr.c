@@ -12,48 +12,33 @@
 #include <assert.h>
 #include <time.h>
 
+#include "dns_message.h"
+
 #define PORT "8053"
-#define MAX_DOMAIN_LENGTH 253
 #define TIMESTAMP_LENGTH 24
+#define MAX_DOMAIN_LENGTH 253
+#define NUM_OF_CACHE_ENTRY 5
+#define LENGTH_OF_ANSWER_SECTION 16
 
-// DNS header, only store information needed for this project
-// 
+#define CACHE
+
+
+
+// A cache_entry should contain a AAAA type question and its answer
+// and cached time
 typedef struct {
-    uint16_t ID;
-    uint16_t QDCOUNT, ANCOUNT;
-}dns_header_t;
-
-typedef struct {
-    char QNAME[MAX_DOMAIN_LENGTH + 1];
-    uint16_t QTYPE, QCLASS;
-}dns_question_t;
-
-typedef struct {
-    char ANAME[MAX_DOMAIN_LENGTH + 1];
-    uint16_t ATYPE, ACLASS;
-    uint32_t TTL;
-    uint16_t RDLENGTH;
-    // store ipv6
-    char address[INET6_ADDRSTRLEN];
-}dns_answer_t;
-
-typedef struct {
-    dns_header_t header;
-    dns_question_t question;
-    dns_answer_t answer;
-}dns_message_t;
-
-typedef struct {
-    uint8_t* tcp_header;
-    uint8_t* body;
-    uint16_t body_size;
-}raw_dns_message_t;
+    dns_message_t message;
+    time_t cache_time;
+}cache_entry_t;
 
 
-dns_message_t read_message(raw_dns_message_t message);
-uint16_t read_two_bytes(uint8_t* start);
-raw_dns_message_t read_raw_message(int fd);
 void get_timestamp(char* timestamp);
+void get_specific_timestamp(char* timestamp, time_t time);
+void cache_evication(cache_entry_t* cache, dns_message_t message, FILE* log);
+bool is_answer_expired(cache_entry_t entry);
+uint32_t read_four_bytes(uint8_t* start);
+int search_in_cache(cache_entry_t* cache, char* QNAME);
+
 
 int main(int argc, char** argv) {
     if(argc < 3) {
@@ -63,15 +48,13 @@ int main(int argc, char** argv) {
 
     FILE* log = fopen("./dns_svr.log", "w");
 
-
+    cache_entry_t cache[NUM_OF_CACHE_ENTRY];
+    for(int i = 0; i < NUM_OF_CACHE_ENTRY; i++) {
+        cache[i].cache_time = 0;
+    }
 
     int listen_sockfd;
 	struct addrinfo hints, *res;
-
-    int newsockfd;
-    struct sockaddr_storage client_addr;
-    socklen_t client_addr_size;
-    client_addr_size = sizeof client_addr;
 
     char timestamp[TIMESTAMP_LENGTH+1];
 
@@ -94,8 +77,6 @@ int main(int argc, char** argv) {
 		exit(EXIT_FAILURE);
 	}
 
-    // printf("listen on socket %d\n", listen_sockfd);
-
     int enable = 1;
     if (setsockopt(listen_sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
         perror("setsockopt");
@@ -116,7 +97,11 @@ int main(int argc, char** argv) {
 	}
 
     while(true){
-        
+        int newsockfd;
+        struct sockaddr_storage client_addr;
+        socklen_t client_addr_size;
+        client_addr_size = sizeof client_addr;
+
         // Accept a connection - blocks until a connection is ready to be accepted
         // Get back a new file descriptor to communicate on
         newsockfd =
@@ -135,21 +120,20 @@ int main(int argc, char** argv) {
         If AAAA request, connect to upstream dns
         */
 
-        raw_dns_message_t raw_message = read_raw_message(newsockfd);
-
-        dns_message_t dns_message = read_message(raw_message);
+        //allocate memory to store the dns message
+        dns_message_t dns_request = read_message(newsockfd);
 
         get_timestamp(timestamp);
-        fprintf(log, "%s requested %s\n", timestamp, dns_message.question.QNAME);
+        fprintf(log, "%s requested %s\n", timestamp, dns_request.question.QNAME);
         fflush(log);
 
-        uint8_t* body = raw_message.body;
+        // The body of the dns packet
+        uint8_t* body = dns_request.packet_body;
 
-        if(dns_message.question.QTYPE != 28) {
+        if(dns_request.question.QTYPE != 28) {
             /*
             Not a AAAA requst, modify the header and return 
             */
-            // printf("not a AAAA request\n");
             get_timestamp(timestamp);
             fprintf(log, "%s unimplemented request\n", timestamp);
             fflush(log);
@@ -165,10 +149,58 @@ int main(int argc, char** argv) {
 
 
             // Sent back to the client
-            write(newsockfd, raw_message.tcp_header, 2);
-            write(newsockfd, raw_message.body, raw_message.body_size);
+            write(newsockfd, dns_request.packet_header, 2);
+            write(newsockfd, dns_request.packet_body, dns_request.packet_body_size);
 
         }else {
+            // Check if answer can be found in cache
+            int index = search_in_cache(cache, dns_request.question.QNAME);
+            if(index != -1) {
+                /* Found in cache, go to the packet body, change ID and TTL
+                    also change update the cache time  
+                */
+                uint8_t* ID = cache[index].message.packet_body;
+                // Set ID to match the request
+                ID[0] = dns_request.packet_body[0];
+                ID[1] = dns_request.packet_body[1];
+
+                // 
+                uint8_t* TTL_ptr = cache[index].message.answer.TTL;
+                uint32_t time_to_live = read_four_bytes(TTL_ptr);
+
+                time_t current;
+                time(&current);
+
+
+                time_to_live -= (current - cache[index].cache_time);
+
+                cache[index].cache_time = current;
+
+                // Storing the updated TTL
+                uint32_t* four_bytes = (void *) TTL_ptr;
+                *four_bytes = htonl(time_to_live);
+
+                
+
+                write(newsockfd, cache[index].message.packet_header, 2);
+                write(newsockfd, cache[index].message.packet_body, cache[index].message.packet_body_size);
+
+                time_t expire_time = current + time_to_live;
+
+                get_timestamp(timestamp);
+                fprintf(log, "%s %s expires at ", timestamp, dns_request.question.QNAME);
+                get_specific_timestamp(timestamp, expire_time);
+                fprintf(log, "%s\n", timestamp);
+                fflush(log);
+                
+                free_dns_message(&dns_request);
+                close(newsockfd);
+                continue;
+
+            
+            }
+
+
             /*
             Yes, AAAA request, send it to upstream server 
             */
@@ -203,15 +235,14 @@ int main(int argc, char** argv) {
             freeaddrinfo(upstream_servinfo);
 
             // Writes to upstream with the DNS request from client
-            write(upstream_sockfd, raw_message.tcp_header, 2);
-            write(upstream_sockfd, raw_message.body, raw_message.body_size);
+            write(upstream_sockfd, dns_request.packet_header, 2);
+            write(upstream_sockfd, dns_request.packet_body, dns_request.packet_body_size);
 
             // Read DNS response from the server
-            raw_dns_message_t raw_dns_response = read_raw_message(upstream_sockfd);
-            dns_message_t dns_response = read_message(raw_dns_response);
+            dns_message_t dns_response = read_message(upstream_sockfd);
 
-            // unsigned char recieve_buffer[256];
-            // read(upstream_sockfd, recieve_buffer, 256);
+            // Cache the reponse
+            cache_evication(cache, dns_response, log);
 
             /*
             Log <timestamp> <domain_name> is at <IP address>
@@ -219,18 +250,25 @@ int main(int argc, char** argv) {
             */
             get_timestamp(timestamp);
             if(dns_response.header.ANCOUNT && dns_response.answer.ATYPE == 28) {
-                fprintf(log, "%s %s is at %s\n",timestamp, dns_message.question.QNAME , dns_response.answer.address);
+                fprintf(log, "%s %s is at %s\n",timestamp, dns_request.question.QNAME , dns_response.answer.address);
                 fflush(log);
             }
 
-            // Writes back to the client
-            write(newsockfd, raw_dns_response.tcp_header, 2);
-            write(newsockfd, raw_dns_response.body, raw_dns_response.body_size);
+            //TODO free the memory allocated to dns_request
+            free_dns_message(&dns_request);
 
+            // Writes back to the client
+            write(newsockfd, dns_response.packet_header, 2);
+            write(newsockfd, dns_response.packet_body, dns_response.packet_body_size);
+
+            
+
+            close(newsockfd);
             close(upstream_sockfd);
         }
         
-        close(newsockfd);
+        
+        
     }
     close(listen_sockfd);
     fclose(log);
@@ -239,116 +277,6 @@ int main(int argc, char** argv) {
 
 
 
-// Reads a dns message
-dns_message_t read_message(raw_dns_message_t message) {
-    dns_message_t dns_message;
-    dns_header_t dns_header;
-    dns_question_t dns_question;
-    // dns_answer_t dns_answer;
-
-    uint8_t* current = message.body;
-    dns_header.ID = read_two_bytes(current);
-
-    // Now points to the 4th byte
-    current += 4;
-
-    dns_header.QDCOUNT = read_two_bytes(current);
-    
-    // Now points to the 6th byte
-    current += 2;
-    dns_header.ANCOUNT = read_two_bytes(current);
-
-    // Now points to the 12th byte, start of question section
-    current += 6;
-
-    int n = *current;
-    current++;
-    int buddy = 0;
-    while(n) {
-        dns_question.QNAME[buddy++] = *current;
-        current++;
-        n--;
-        if(n == 0) {
-            dns_question.QNAME[buddy++] = '.';
-            n = *current;
-            current++;
-        }
-    }
-    dns_question.QNAME[buddy - 1] = '\0';
-
-    // current should now be pointing to QTYPE
-    dns_question.QTYPE = read_two_bytes(current);
-
-    // Now points to the start of answer section
-    current += 4;
-    // If there is a answer section
-    // Read the answer section and store the first one
-    if(dns_header.ANCOUNT) {
-        dns_answer_t dns_answer;
-        // Now points to type
-        current += 2;
-        dns_answer.ATYPE = read_two_bytes(current);
-        
-        // Now points to TTL
-        current += 4;
-
-        // Now points to RDATA
-        current += 6;
-        if(inet_ntop(AF_INET6, current, dns_answer.address, INET6_ADDRSTRLEN) == NULL) {
-            perror("inet_ntop");
-            exit(EXIT_FAILURE);
-        }
-        dns_message.answer = dns_answer;
-    }
-
-    dns_message.header = dns_header;
-    dns_message.question = dns_question;
-
-    return dns_message;
-}
-
-uint16_t read_two_bytes(uint8_t* start) {
-    uint16_t* two_byte = (void*) start;
-    return ntohs(*two_byte);
-}
-
-raw_dns_message_t read_raw_message(int fd) {
-    raw_dns_message_t message;
-
-    uint8_t *header_buffer = (uint8_t*) malloc(sizeof(uint8_t) * 2);
-    assert(header_buffer);
-
-    uint16_t size = 2;
-
-    while(size > 0) {
-        size -= read(fd, header_buffer+(2-size), size);
-    }
-
-    // for(int i = 0; i < 2; i++) printf("%02x ",header_buffer[i]);
-
-    size = read_two_bytes(header_buffer);
-    message.body_size = read_two_bytes(header_buffer);
-
-    uint8_t* body_buffer = (uint8_t*) malloc(sizeof(uint8_t) * size);
-    assert(body_buffer);
-
-    while(size > 0) {
-        size -= read(fd, body_buffer+(message.body_size-size), size);
-    }
-
-    // for(int i = 0; i < message.body_size; i++) printf("%02x ",body_buffer[i]);
-    message.tcp_header = header_buffer;
-    message.body = body_buffer;
-    
-
-    return message;
-}
-
-void free_raw_message(raw_dns_message_t* message) {
-    free(message->tcp_header);
-    free(message->body);
-}
-
 void get_timestamp(char* timestamp) {
     time_t rawtime;
     struct tm *info;
@@ -356,3 +284,84 @@ void get_timestamp(char* timestamp) {
     info = localtime(&rawtime);
     strftime(timestamp, TIMESTAMP_LENGTH + 1, "%FT%T%z", info);
 }
+
+void get_specific_timestamp(char* timestamp, time_t time) {
+    struct tm *info;
+    info = localtime(&time);
+    strftime(timestamp, TIMESTAMP_LENGTH + 1, "%FT%T%z", info);
+}
+
+void cache_evication(cache_entry_t* cache, dns_message_t message, FILE* log) {
+    time_t current;
+    time(&current);
+    char timestamp[TIMESTAMP_LENGTH + 1];
+    get_specific_timestamp(timestamp, current);
+
+    for(int i = 0; i < NUM_OF_CACHE_ENTRY; i++) {
+        
+        if(is_answer_expired(cache[i])) {
+            
+            // free the space allocated
+            if(cache[i].cache_time != 0) {
+                fprintf(log, "%s replacing %s by %s\n", timestamp, 
+                cache[i].message.question.QNAME, message.question.QNAME);
+                fflush(log);
+                free_dns_message(&(cache[i].message));
+            }
+            
+            // Store the current message in cache
+            cache[i].message = message;
+            cache[i].cache_time = current;
+
+            
+            
+            
+
+            return;
+        }
+        
+    }
+    fprintf(log, "%s replacing %s by %s\n", timestamp, 
+    cache[0].message.question.QNAME, message.question.QNAME);
+    fflush(log);
+    // If all are not expired
+    // Evicate the first entry in cache
+    free_dns_message(&(cache[0].message)); 
+    cache[0].message = message;
+    cache[0].cache_time = current;
+}
+
+
+// Check if an answer has expired
+bool is_answer_expired(cache_entry_t entry) {
+    // If the message is a NULL pointer
+    if(!entry.cache_time) {
+        return true;
+    }
+    time_t current;
+    time(&current);
+    uint32_t time_to_live = read_four_bytes(entry.message.answer.TTL);
+    // printf("%d\n",time_to_live);
+    // printf("%d\n", (current - entry.cache_time) <= time_to_live);
+
+    return (current - entry.cache_time) > time_to_live;
+}
+
+uint32_t read_four_bytes(uint8_t* start) {
+    uint32_t* four_bytes = (void*) start;
+    return ntohl(*four_bytes);
+}
+
+// Seach in the cache to see if we can find same question
+// Return -1 if not found
+int search_in_cache(cache_entry_t* cache, char* QNAME) {
+    for(int i = 0; i < NUM_OF_CACHE_ENTRY; i++) {
+        if(!is_answer_expired(cache[i]) && !strcmp(QNAME, cache[i].message.question.QNAME)) {
+            return i;
+        }
+    }
+    // printf("%s not found in cache\n", QNAME);
+    return -1;
+}
+
+
