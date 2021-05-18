@@ -12,3 +12,4 @@ dns_message.o: dns_message.c dns_message.h
 clean:
 	rm -f dns_svr
 	rm -f *.o
+	rm -f dns_svr.log
