@@ -1,17 +1,6 @@
 #ifndef DNS_MESSAGE_H
 #define DNS_MESSAGE_H
 
-#include <netdb.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <stdbool.h>
-#include <arpa/inet.h>
-#include <sys/select.h>
-#include <sys/sendfile.h>
-#include <assert.h>
-
 #define MAX_DOMAIN_LENGTH 253
 
 
@@ -46,9 +35,16 @@ typedef struct {
     uint16_t packet_body_size;
 }dns_message_t;
 
-
+/* 
+Read a dns_message from a file descriptor and return it 
+Will allocate memory to store the raw packet
+*/
 dns_message_t read_message(int fd);
+
+// Free memory allocated by read_message()
 void free_dns_message(dns_message_t* dns_message);
+
+// Convert two bytes from network order to unsigned short
 uint16_t read_two_bytes(uint8_t* start);
 
 #endif

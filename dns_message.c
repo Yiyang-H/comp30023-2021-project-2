@@ -11,6 +11,7 @@
 
 #include "dns_message.h"
 
+#define SIZE_OF_TCP_HEADER 2
 
 dns_message_t read_message(int fd);
 uint16_t read_two_bytes(uint8_t* start);
@@ -21,13 +22,12 @@ dns_message_t read_message(int fd) {
     dns_message_t dns_message;
     dns_header_t dns_header;
     dns_question_t dns_question;
-    
-    uint8_t *header_buffer = (uint8_t*) malloc(sizeof(uint8_t) * 2);
+    uint8_t *header_buffer = (uint8_t*) malloc(sizeof(uint8_t) * SIZE_OF_TCP_HEADER);
     assert(header_buffer);
 
-    uint16_t size = 2;
+    uint16_t size = SIZE_OF_TCP_HEADER;
     while(size > 0) {
-        size -= read(fd, header_buffer+(2-size), size);
+        size -= read(fd, header_buffer+(SIZE_OF_TCP_HEADER-size), size);
     }
 
     // The size of the body
@@ -42,7 +42,6 @@ dns_message_t read_message(int fd) {
     while(size > 0) {
         size -= read(fd, body_buffer+(dns_message.packet_body_size-size), size);
     }
-
     dns_message.packet_body = body_buffer;
 
     /* 
@@ -108,7 +107,6 @@ dns_message_t read_message(int fd) {
         }
         dns_message.answer = dns_answer;
     }
-
     dns_message.header = dns_header;
     dns_message.question = dns_question;
     return dns_message;
