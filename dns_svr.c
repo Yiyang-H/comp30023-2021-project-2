@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <time.h>
 
+
 #include "dns_message.h"
 
 #define PORT "8053"
@@ -21,6 +22,7 @@
 #define LENGTH_OF_ANSWER_SECTION 16
 
 #define CACHE
+#define NONBLOCKING
 
 
 
@@ -96,184 +98,236 @@ int main(int argc, char** argv) {
 		exit(EXIT_FAILURE);
 	}
 
+    // initialise an active file descriptors set
+	fd_set masterfds;
+	FD_ZERO(&masterfds);
+	FD_SET(listen_sockfd, &masterfds);
+	// record the maximum socket number
+	int maxfd = listen_sockfd;
+
+    int map_upstream_to_client[FD_SETSIZE];
+
+    
     while(true){
-        int newsockfd;
-        struct sockaddr_storage client_addr;
-        socklen_t client_addr_size;
-        client_addr_size = sizeof client_addr;
+        // monitor file descriptors
+		fd_set readfds = masterfds;
+		if (select(FD_SETSIZE, &readfds, NULL, NULL, NULL) < 0) {
+			perror("select");
+			exit(EXIT_FAILURE);
+		}
 
-        // Accept a connection - blocks until a connection is ready to be accepted
-        // Get back a new file descriptor to communicate on
-        newsockfd =
-            accept(listen_sockfd, (struct sockaddr*)&client_addr, &client_addr_size);
-        if (newsockfd < 0) {
-            perror("accept");
-            exit(EXIT_FAILURE);
-        }
+        for(int i = 0 ; i <= maxfd; i++) {
+            // Check if current fd is active
+            if(FD_ISSET(i, &readfds)) {
+                // Determine if current fd is which one of the following:
+                // 1. The passive socket waiting to be connected
+                // 2. A client socket sending request
+                // 3. A server socket sending response
 
-        // printf("client socket created at %d!\n", newsockfd);
+                if(i == listen_sockfd) {
+                    // If new connection coming in, establish the connection
+                    int newsockfd;
+                    struct sockaddr_storage client_addr;
+                    socklen_t client_addr_size;
+                    client_addr_size = sizeof client_addr;
 
-        /* 
-        Connection established with client
-        Need to read() dns message from client
-        Handle the dns message: check QType in question section
-        If AAAA request, connect to upstream dns
-        */
-
-        //allocate memory to store the dns message
-        dns_message_t dns_request = read_message(newsockfd);
-
-        get_timestamp(timestamp);
-        fprintf(log, "%s requested %s\n", timestamp, dns_request.question.QNAME);
-        fflush(log);
-
-        // The body of the dns packet
-        uint8_t* body = dns_request.packet_body;
-
-        if(dns_request.question.QTYPE != 28) {
-            /*
-            Not a AAAA requst, modify the header and return 
-            */
-            get_timestamp(timestamp);
-            fprintf(log, "%s unimplemented request\n", timestamp);
-            fflush(log);
-
-            // Set QR to 1
-            body[2] = body[2] | 128;
-
-            // Set RCODE to 4
-            body[3] = (body[3] & 240) | 4;
-
-            // Set RA from 0 to 1
-            body[3] ^= (1 << 7);
+                    // Accept a connection - blocks until a connection is ready to be accepted
+                    // Get back a new file descriptor to communicate on
+                    newsockfd =
+                        accept(listen_sockfd, (struct sockaddr*)&client_addr, &client_addr_size);
+                    if (newsockfd < 0) {
+                        perror("accept");
+                        exit(EXIT_FAILURE);
+                    }else {
+                        // add the socket to the set
+						FD_SET(newsockfd, &masterfds);
+						// update the maximum tracker
+						if (newsockfd > maxfd)
+							maxfd = newsockfd;
+                    }
 
 
-            // Sent back to the client
-            write(newsockfd, dns_request.packet_header, 2);
-            write(newsockfd, dns_request.packet_body, dns_request.packet_body_size);
+                }else {
+                    // Read the dns_message first, determine if it a req or response
+                    dns_message_t dns_message = read_message(i);
+                    if(dns_message.header.QR == 0) {
+                        // A request, check in cache, or connect to upstream
 
-        }else {
-            // Check if answer can be found in cache
-            int index = search_in_cache(cache, dns_request.question.QNAME);
-            if(index != -1) {
-                /* Found in cache, go to the packet body, change ID and TTL
-                    also change update the cache time  
-                */
-                uint8_t* ID = cache[index].message.packet_body;
-                // Set ID to match the request
-                ID[0] = dns_request.packet_body[0];
-                ID[1] = dns_request.packet_body[1];
+                        get_timestamp(timestamp);
+                        fprintf(log, "%s requested %s\n", timestamp, dns_message.question.QNAME);
+                        fflush(log);
 
-                // 
-                uint8_t* TTL_ptr = cache[index].message.answer.TTL;
-                uint32_t time_to_live = read_four_bytes(TTL_ptr);
+                        // The body of the dns packet
+                        uint8_t* body = dns_message.packet_body;
 
-                time_t current;
-                time(&current);
+                        if(dns_message.question.QTYPE != 28) {
+                            /*
+                            Not a AAAA requst, modify the header and return 
+                            */
+                            get_timestamp(timestamp);
+                            fprintf(log, "%s unimplemented request\n", timestamp);
+                            fflush(log);
+
+                            // Set QR to 1
+                            body[2] = body[2] | 128;
+
+                            // Set RCODE to 4
+                            body[3] = (body[3] & 240) | 4;
+
+                            // Set RA from 0 to 1
+                            body[3] ^= (1 << 7);
 
 
-                time_to_live -= (current - cache[index].cache_time);
+                            // Sent back to the client
+                            write(i, dns_message.packet_header, 2);
+                            write(i, dns_message.packet_body, dns_message.packet_body_size);
 
-                cache[index].cache_time = current;
+                            free_dns_message(&dns_message);
+                            close(i);
+                            FD_CLR(i, &masterfds);
 
-                // Storing the updated TTL
-                uint32_t* four_bytes = (void *) TTL_ptr;
-                *four_bytes = htonl(time_to_live);
+                        }
+                        else {
+                            // Check if answer can be found in cache
+                            int index = search_in_cache(cache, dns_message.question.QNAME);
+                            if(index != -1) {
+                                /* Found in cache, go to the packet body, change ID and TTL
+                                    also change update the cache time  
+                                */
+                                uint8_t* ID = cache[index].message.packet_body;
+                                // Set ID to match the request
+                                ID[0] = dns_message.packet_body[0];
+                                ID[1] = dns_message.packet_body[1];
 
-                
+                                
+                                uint8_t* TTL_ptr = cache[index].message.answer.TTL;
+                                uint32_t time_to_live = read_four_bytes(TTL_ptr);
 
-                write(newsockfd, cache[index].message.packet_header, 2);
-                write(newsockfd, cache[index].message.packet_body, cache[index].message.packet_body_size);
+                                time_t current;
+                                time(&current);
 
-                time_t expire_time = current + time_to_live;
 
-                get_timestamp(timestamp);
-                fprintf(log, "%s %s expires at ", timestamp, dns_request.question.QNAME);
-                get_specific_timestamp(timestamp, expire_time);
-                fprintf(log, "%s\n", timestamp);
+                                time_to_live -= (current - cache[index].cache_time);
 
-                if(cache[index].message.header.ANCOUNT && cache[index].message.answer.ATYPE == 28) {
-                    fprintf(log, "%s %s is at %s\n",timestamp, dns_request.question.QNAME , cache[index].message.answer.address);
+                                cache[index].cache_time = current;
+
+                                // Storing the updated TTL
+                                uint32_t* four_bytes = (void *) TTL_ptr;
+                                *four_bytes = htonl(time_to_live);
+
+                                
+
+                                write(i, cache[index].message.packet_header, 2);
+                                write(i, cache[index].message.packet_body, cache[index].message.packet_body_size);
+
+                                time_t expire_time = current + time_to_live;
+
+                                get_timestamp(timestamp);
+                                fprintf(log, "%s %s expires at ", timestamp, dns_message.question.QNAME);
+                                get_specific_timestamp(timestamp, expire_time);
+                                fprintf(log, "%s\n", timestamp);
+
+                                if(cache[index].message.header.ANCOUNT && cache[index].message.answer.ATYPE == 28) {
+                                    fprintf(log, "%s %s is at %s\n",timestamp, dns_message.question.QNAME , cache[index].message.answer.address);
+                                }
+
+                                fflush(log);
+                                
+                                free_dns_message(&dns_message);
+                                close(i);
+                                FD_CLR(i, &masterfds);
+                            
+                            }
+                            else {
+                                // Cannot find answer in cache, ask upstream
+                                // Create a socket to connet to server
+                                int upstream_sockfd;
+                                struct addrinfo upstream_hints, *upstream_servinfo, *upstream_rp;
+
+                                memset(&upstream_hints, 0, sizeof upstream_hints);
+                                upstream_hints.ai_family = AF_INET;
+                                upstream_hints.ai_socktype = SOCK_STREAM;
+                                s = getaddrinfo(argv[1], argv[2], &upstream_hints, &upstream_servinfo);
+                                if (s != 0) {
+                                    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(s));
+                                    exit(EXIT_FAILURE);
+                                }
+
+                                for (upstream_rp = upstream_servinfo; upstream_rp != NULL; upstream_rp = upstream_rp->ai_next) {
+                                    upstream_sockfd = socket(upstream_rp->ai_family, upstream_rp->ai_socktype, upstream_rp->ai_protocol);
+                                    if (upstream_sockfd == -1)
+                                        continue;
+
+                                    if (connect(upstream_sockfd, upstream_rp->ai_addr, upstream_rp->ai_addrlen) != -1)
+                                        break; // success
+
+                                    close(upstream_sockfd);
+                                }
+                                if (upstream_rp == NULL) {
+                                    fprintf(stderr, "client: failed to connect\n");
+                                    exit(EXIT_FAILURE);
+                                }
+                                freeaddrinfo(upstream_servinfo);
+
+                                // Writes to upstream with the DNS request from client
+                                write(upstream_sockfd, dns_message.packet_header, 2);
+                                write(upstream_sockfd, dns_message.packet_body, dns_message.packet_body_size);
+
+                                // free the memory allocated to dns_request
+                                free_dns_message(&dns_message);
+
+                                // Add upstream socket to masterfds
+                                FD_SET(upstream_sockfd, &masterfds);
+                                // Update maximum
+                                if(upstream_sockfd > maxfd) {
+                                    maxfd = upstream_sockfd;
+                                }
+
+                                // Add a mapping from upstream to client
+                                map_upstream_to_client[upstream_sockfd] = i;
+
+                            }
+
+
+                        }
+
+
+
+                    }
+                    else if(dns_message.header.QR == 1) {
+                        // A response, cache evication, send back to client
+
+                        // Cache the reponse
+                        cache_evication(cache, dns_message, log);
+
+                        /*
+                        Log <timestamp> <domain_name> is at <IP address>
+                        Cache the question and answer
+                        */
+                        get_timestamp(timestamp);
+                        if(dns_message.header.ANCOUNT && dns_message.answer.ATYPE == 28) {
+                            fprintf(log, "%s %s is at %s\n",timestamp, dns_message.question.QNAME , dns_message.answer.address);
+                            fflush(log);
+                        }
+                        // Writes back to the client
+                        write(map_upstream_to_client[i], dns_message.packet_header, 2);
+                        write(map_upstream_to_client[i], dns_message.packet_body, dns_message.packet_body_size);
+
+                        
+                        close(i);
+                        FD_CLR(i, &masterfds);
+                        close(map_upstream_to_client[i]);
+                        FD_CLR(map_upstream_to_client[i], &masterfds);
+
+                    }
+                    else {
+                        fprintf(stderr, "Wrong QR type\n");
+                    }
+
                 }
-                
-                fflush(log);
-                
-                free_dns_message(&dns_request);
-                close(newsockfd);
-                continue;
-
-            
             }
-
-
-            /*
-            Yes, AAAA request, send it to upstream server 
-            */
-
-            // Create a socket to connet to server
-            int upstream_sockfd;
-            struct addrinfo upstream_hints, *upstream_servinfo, *upstream_rp;
-
-            memset(&upstream_hints, 0, sizeof upstream_hints);
-            upstream_hints.ai_family = AF_INET;
-            upstream_hints.ai_socktype = SOCK_STREAM;
-            s = getaddrinfo(argv[1], argv[2], &upstream_hints, &upstream_servinfo);
-            if (s != 0) {
-                fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(s));
-                exit(EXIT_FAILURE);
-            }
-
-            for (upstream_rp = upstream_servinfo; upstream_rp != NULL; upstream_rp = upstream_rp->ai_next) {
-                upstream_sockfd = socket(upstream_rp->ai_family, upstream_rp->ai_socktype, upstream_rp->ai_protocol);
-                if (upstream_sockfd == -1)
-                    continue;
-
-                if (connect(upstream_sockfd, upstream_rp->ai_addr, upstream_rp->ai_addrlen) != -1)
-                    break; // success
-
-                close(upstream_sockfd);
-            }
-            if (upstream_rp == NULL) {
-                fprintf(stderr, "client: failed to connect\n");
-                exit(EXIT_FAILURE);
-            }
-            freeaddrinfo(upstream_servinfo);
-
-            // Writes to upstream with the DNS request from client
-            write(upstream_sockfd, dns_request.packet_header, 2);
-            write(upstream_sockfd, dns_request.packet_body, dns_request.packet_body_size);
-
-            // Read DNS response from the server
-            dns_message_t dns_response = read_message(upstream_sockfd);
-
-            // Cache the reponse
-            cache_evication(cache, dns_response, log);
-
-            /*
-            Log <timestamp> <domain_name> is at <IP address>
-            Cache the question and answer
-            */
-            get_timestamp(timestamp);
-            if(dns_response.header.ANCOUNT && dns_response.answer.ATYPE == 28) {
-                fprintf(log, "%s %s is at %s\n",timestamp, dns_request.question.QNAME , dns_response.answer.address);
-                fflush(log);
-            }
-
-            //TODO free the memory allocated to dns_request
-            free_dns_message(&dns_request);
-
-            // Writes back to the client
-            write(newsockfd, dns_response.packet_header, 2);
-            write(newsockfd, dns_response.packet_body, dns_response.packet_body_size);
-
-            
-
-            close(newsockfd);
-            close(upstream_sockfd);
         }
-        
-        
-        
+     
     }
     close(listen_sockfd);
     fclose(log);

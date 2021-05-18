@@ -51,8 +51,12 @@ dns_message_t read_message(int fd) {
     uint8_t* current = body_buffer;
     dns_header.ID = read_two_bytes(current);
 
+    // Now points to the 2nd byte
+    current += 2;
+    dns_header.QR = (*current) >> 7;
+
     // Now points to the 4th byte
-    current += 4;
+    current += 2;
 
     dns_header.QDCOUNT = read_two_bytes(current);
     

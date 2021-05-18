@@ -19,6 +19,7 @@
 // 
 typedef struct {
     uint16_t ID;
+    bool QR;
     uint16_t QDCOUNT, ANCOUNT;
 }dns_header_t;
 
