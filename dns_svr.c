@@ -193,6 +193,7 @@ int main(int argc, char** argv) {
                 fprintf(log, "%s\n", timestamp);
 
                 if(cache[index].message.header.ANCOUNT && cache[index].message.answer.ATYPE == 28) {
+                    get_timestamp(timestamp);
                     fprintf(log, "%s %s is at %s\n",timestamp, dns_request.question.QNAME , cache[index].message.answer.address);
                 }
                 
