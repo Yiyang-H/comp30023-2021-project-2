@@ -191,6 +191,11 @@ int main(int argc, char** argv) {
                 fprintf(log, "%s %s expires at ", timestamp, dns_request.question.QNAME);
                 get_specific_timestamp(timestamp, expire_time);
                 fprintf(log, "%s\n", timestamp);
+
+                if(cache[index].message.header.ANCOUNT && cache[index].message.answer.ATYPE == 28) {
+                    fprintf(log, "%s %s is at %s\n",timestamp, dns_request.question.QNAME , cache[index].message.answer.address);
+                }
+                
                 fflush(log);
                 
                 free_dns_message(&dns_request);
